@@ -1,0 +1,1012 @@
+Fouad Kh, [09/10/2026 23:58]
+// ============================================================
+
+//      ESP32 38-PIN - FAST QTR-8A LINE FOLLOWER
+
+//      ESP-IDF v5.x
+
+//
+
+//      QTR-8A Analog + PD/PID + Dynamic Speed
+
+//      + D Filtering + Recovery + Intersection Detection
+
+//      + Acceleration Limiting
+
+//      + TB6612FNG
+
+// ============================================================
+#include <stdio.h>
+
+#include <stdlib.h>
+
+#include <stdbool.h>
+
+#include <math.h>
+#include "freertos/FreeRTOS.h"
+
+#include "freertos/task.h"
+
+#include "driver/gpio.h"
+
+#include "driver/ledc.h"
+
+#include "esp_adc/adc_oneshot.h"
+// ============================================================
+
+//                         MOTOR PINS
+
+// ============================================================
+#define AIN1  GPIO_NUM_18
+
+#define AIN2  GPIO_NUM_19
+
+#define PWMA  GPIO_NUM_23
+#define BIN1  GPIO_NUM_21
+
+#define BIN2  GPIO_NUM_22
+
+#define PWMB  GPIO_NUM_17
+#define STBY  GPIO_NUM_16
+
+#define LED   GPIO_NUM_2
+// ============================================================
+
+//                           PWM
+
+// ============================================================
+#define PWM_FREQ  20000
+
+#define PWM_RES   LEDC_TIMER_8_BIT
+#define CH_A      LEDC_CHANNEL_0
+
+#define CH_B      LEDC_CHANNEL_1
+// ============================================================
+
+//                         SENSORS
+
+// ============================================================
+#define NUM_SENSORS 8
+// Left -> Right
+
+//
+
+// GPIO36,39,34,35,32,33 = ADC1
+
+// GPIO25,26             = ADC2
+typedef struct {
+
+adc_unit_t unit;
+
+adc_channel_t channel;
+
+} sensor_t;
+static const sensor_t sensors[NUM_SENSORS] = {
+{ADC_UNIT_1, ADC_CHANNEL_0},   // GPIO36  
+{ADC_UNIT_1, ADC_CHANNEL_3},   // GPIO39  
+{ADC_UNIT_1, ADC_CHANNEL_6},   // GPIO34  
+{ADC_UNIT_1, ADC_CHANNEL_7},   // GPIO35  
+{ADC_UNIT_1, ADC_CHANNEL_4},   // GPIO32  
+{ADC_UNIT_1, ADC_CHANNEL_5},   // GPIO33  
+{ADC_UNIT_2, ADC_CHANNEL_8},   // GPIO25  
+{ADC_UNIT_2, ADC_CHANNEL_9}    // GPIO26
+};
+static adc_oneshot_unit_handle_t adc1;
+
+static adc_oneshot_unit_handle_t adc2;
+static int sensorMin[NUM_SENSORS];
+
+static int sensorMax[NUM_SENSORS];
+// ============================================================
+
+//                        SENSOR WEIGHTS
+
+// ============================================================
+// Position = 0 ... 7000
+
+//
+
+// Left        Center        Right
+
+// -3500 ... 0 ... +3500
+static const int weights[NUM_SENSORS] = {
+0,  
+1000,  
+2000,  
+3000,  
+4000,  
+5000,  
+6000,  
+7000
+};
+#define SET_POINT 3500
+// ============================================================
+
+//                           PID
+
+// ============================================================
+float Kp = 0.22f;
+
+float Ki = 0.0f;
+
+float Kd = 7.0f;
+// Integral
+
+static float integral = 0.0f;
+// Previous error
+
+static float lastError = 0.0f;
+// Filtered derivative
+
+static float filteredD = 0.0f;
+// ============================================================
+
+//                       SPEED SETTINGS
+
+// ============================================================
+#define MAX_SPEED       220
+
+#define MIN_SPEED        80
+#define SHARP_TURN_SPEED  95
+// Error at which speed starts decreasing
+
+#define SPEED_START_ERROR 500
+// Error where minimum speed is reached
+
+#define SPEED_MAX_ERROR   3500
+// ============================================================
+
+//                   ACCELERATION LIMIT
+
+// ============================================================
+// Prevents sudden jumps in motor PWM
+#define ACCEL_STEP 8
+static int currentLeftSpeed  = 0;
+
+static int currentRightSpeed = 0;
+// ============================================================
+
+//                    LINE DETECTION
+
+// ============================================================
+#define LINE_THRESHOLD 180
+// If almost all sensors see the line
+
+#define INTERSECTION_COUNT 7
+// ============================================================
+
+//                         HELPERS
+
+// ============================================================
+static int clamp_int(int x, int min, int max)
+
+{
+
+if (x < min)
+
+Fouad Kh, [09/10/2026 23:58]
+return min;
+if (x > max)  
+    return max;  
+
+return x;
+}
+static float clamp_float(float x, float min, float max)
+
+{
+
+if (x < min)
+
+return min;
+if (x > max)  
+    return max;  
+
+return x;
+}
+static int map_int(
+
+int x,
+
+int in_min,
+
+int in_max,
+
+int out_min,
+
+int out_max
+
+)
+
+{
+
+if (in_max == in_min)
+
+return out_min;
+return (x - in_min) *  
+       (out_max - out_min) /  
+       (in_max - in_min)  
+       + out_min;
+}
+// ============================================================
+
+//                       READ SENSOR
+
+// ============================================================
+static int read_sensor(int i)
+
+{
+
+int raw = 0;
+adc_oneshot_unit_handle_t h =  
+    (sensors[i].unit == ADC_UNIT_1)  
+    ? adc1  
+    : adc2;  
+
+adc_oneshot_read(  
+    h,  
+    sensors[i].channel,  
+    &raw  
+);  
+
+return raw;
+}
+// ============================================================
+
+//                       MOTOR CONTROL
+
+// ============================================================
+static void set_motor(
+
+gpio_num_t in1,
+
+gpio_num_t in2,
+
+ledc_channel_t channel,
+
+int speed
+
+)
+
+{
+
+if (speed >= 0)
+
+{
+
+gpio_set_level(in1, 1);
+
+gpio_set_level(in2, 0);
+
+}
+
+else
+
+{
+
+gpio_set_level(in1, 0);
+
+gpio_set_level(in2, 1);
+speed = abs(speed);  
+}  
+
+speed = clamp_int(speed, 0, 255);  
+
+ledc_set_duty(  
+    LEDC_LOW_SPEED_MODE,  
+    channel,  
+    speed  
+);  
+
+ledc_update_duty(  
+    LEDC_LOW_SPEED_MODE,  
+    channel  
+);
+}
+static void driveMotors(int left, int right)
+
+{
+
+set_motor(
+
+AIN1,
+
+AIN2,
+
+CH_A,
+
+left
+
+);
+set_motor(  
+    BIN1,  
+    BIN2,  
+    CH_B,  
+    right  
+);
+}
+// ============================================================
+
+//                 ACCELERATION LIMITER
+
+// ============================================================
+static int approachSpeed(
+
+int current,
+
+int target
+
+)
+
+{
+
+if (target > current)
+
+{
+
+current += ACCEL_STEP;
+if (current > target)  
+        current = target;  
+}  
+
+else if (target < current)  
+{  
+    current -= ACCEL_STEP;  
+
+    if (current < target)  
+        current = target;  
+}  
+
+return current;
+}
+static void driveSmooth(
+
+int targetLeft,
+
+int targetRight
+
+)
+
+{
+
+targetLeft =
+
+clamp_int(targetLeft, -255, 255);
+targetRight =  
+    clamp_int(targetRight, -255, 255);  
+
+currentLeftSpeed =  
+    approachSpeed(  
+        currentLeftSpeed,  
+        targetLeft  
+    );  
+
+currentRightSpeed =  
+    approachSpeed(  
+        currentRightSpeed,  
+        targetRight  
+    );  
+
+driveMotors(  
+    currentLeftSpeed,  
+    currentRightSpeed  
+);
+}
+// ============================================================
+
+//                         GPIO INIT
+
+// ============================================================
+static void gpio_init_all(void)
+
+{
+
+gpio_config_t io = {
+.pin_bit_mask =  
+        (1ULL << AIN1) |  
+        (1ULL << AIN2) |  
+        (1ULL << BIN1) |  
+        (1ULL << BIN2) |  
+        (1ULL << STBY) |  
+        (1ULL << LED),  
+
+    .mode = GPIO_MODE_OUTPUT  
+};  
+
+gpio_config(&io);  
+
+gpio_set_level(STBY, 1);  
+gpio_set_level(LED, 0);
+}
+// ============================================================
+
+//                          PWM INIT
+
+// ============================================================
+static void pwm_init(void)
+
+{
+
+ledc_timer_config_t timer = {
+.speed_mode =  
+        LEDC_LOW_SPEED_MODE,  
+
+    .timer_num =  
+        LEDC_TIMER_0,  
+
+    .duty_resolution =  
+        PWM_RES,  
+
+    .freq_hz =  
+        PWM_FREQ,  
+
+    .clk_cfg =  
+        LEDC_AUTO_CLK  
+};  
+
+ledc_timer_config(&timer);  
+
+
+ledc_channel_config_t channelA = {  
+
+    .gpio_num =  
+        PWMA,  
+
+    .speed_mode =  
+        LEDC_LOW_SPEED_MODE,  
+
+    .channel =  
+        CH_A,  
+
+    .timer_sel =  
+        LEDC_TIMER_0,  
+
+    .duty =  
+        0,  
+
+    .hpoint =  
+        0  
+};  
+
+ledc_channel_config(&channelA);  
+
+
+ledc_channel_config_t channelB =  
+    channelA;  
+
+channelB.gpio_num = PWMB;  
+channelB.channel  = CH_B;  
+
+ledc_channel_config(&channelB);
+}
+// ============================================================
+
+//                           ADC INIT
+
+Fouad Kh, [09/10/2026 23:58]
+// ============================================================
+static void adc_init(void)
+
+{
+
+adc_oneshot_unit_init_cfg_t cfg1 = {
+.unit_id =  
+        ADC_UNIT_1  
+};  
+
+adc_oneshot_unit_init_cfg_t cfg2 = {  
+
+    .unit_id =  
+        ADC_UNIT_2  
+};  
+
+
+adc_oneshot_new_unit(  
+    &cfg1,  
+    &adc1  
+);  
+
+adc_oneshot_new_unit(  
+    &cfg2,  
+    &adc2  
+);  
+
+
+adc_oneshot_chan_cfg_t channelConfig = {  
+
+    .atten =  
+        ADC_ATTEN_DB_12,  
+
+    .bitwidth =  
+        ADC_BITWIDTH_12  
+};  
+
+
+for (int i = 0; i < NUM_SENSORS; i++)  
+{  
+    adc_oneshot_unit_handle_t h =  
+        (sensors[i].unit == ADC_UNIT_1)  
+        ? adc1  
+        : adc2;  
+
+    adc_oneshot_config_channel(  
+        h,  
+        sensors[i].channel,  
+        &channelConfig  
+    );  
+
+    sensorMin[i] = 4095;  
+    sensorMax[i] = 0;  
+}
+}
+// ============================================================
+
+//                         CALIBRATION
+
+// ============================================================
+static void calibrate(void)
+
+{
+
+printf(
+
+"\n=================================\n"
+
+"       SENSOR CALIBRATION\n"
+
+"=================================\n"
+
+"Move the robot/sensor over WHITE\n"
+
+"and BLACK areas for 5 seconds.\n\n"
+
+);
+gpio_set_level(LED, 1);  
+
+
+for (int n = 0; n < 250; n++)  
+{  
+    for (int i = 0; i < NUM_SENSORS; i++)  
+    {  
+        int value =  
+            read_sensor(i);  
+
+        if (value < sensorMin[i])  
+            sensorMin[i] = value;  
+
+        if (value > sensorMax[i])  
+            sensorMax[i] = value;  
+    }  
+
+    vTaskDelay(  
+        pdMS_TO_TICKS(20)  
+    );  
+}  
+
+
+gpio_set_level(LED, 0);  
+
+
+printf("\nCalibration complete.\n");  
+
+for (int i = 0; i < NUM_SENSORS; i++)  
+{  
+    printf(  
+        "S%d : MIN=%d MAX=%d\n",  
+        i + 1,  
+        sensorMin[i],  
+        sensorMax[i]  
+    );  
+}  
+
+
+printf(  
+    "\nStarting in 3 seconds...\n"  
+);  
+
+
+for (int i = 0; i < 3; i++)  
+{  
+    gpio_set_level(LED, 1);  
+
+    vTaskDelay(  
+        pdMS_TO_TICKS(250)  
+    );  
+
+    gpio_set_level(LED, 0);  
+
+    vTaskDelay(  
+        pdMS_TO_TICKS(750)  
+    );  
+}
+}
+// ============================================================
+
+//                    READ + POSITION
+
+// ============================================================
+static bool getLinePosition(
+
+int *position,
+
+int *activeCount
+
+)
+
+{
+
+long weightedSum = 0;
+
+long total = 0;
+int count = 0;  
+
+
+for (int i = 0; i < NUM_SENSORS; i++)  
+{  
+    int raw =  
+        read_sensor(i);  
+
+
+    int value =  
+        map_int(  
+            raw,  
+            sensorMin[i],  
+            sensorMax[i],  
+            0,  
+            1000  
+        );  
+
+
+    value =  
+        clamp_int(  
+            value,  
+            0,  
+            1000  
+        );  
+
+
+    if (value > LINE_THRESHOLD)  
+    {  
+        count++;  
+    }  
+
+
+    weightedSum +=  
+        (long)value *  
+        weights[i];  
+
+
+    total += value;  
+}  
+
+
+*activeCount = count;  
+
+
+if (total <= 0)  
+    return false;  
+
+
+*position =  
+    (int)(  
+        weightedSum /  
+        total  
+    );  
+
+
+return true;
+}
+// ============================================================
+
+//                    DYNAMIC SPEED
+
+// ============================================================
+static int calculateBaseSpeed(
+
+float absError
+
+)
+
+{
+
+if (absError <= SPEED_START_ERROR)
+
+{
+
+return MAX_SPEED;
+
+}
+int speed =  
+    map_int(  
+        (int)absError,  
+        SPEED_START_ERROR,  
+        SPEED_MAX_ERROR,  
+        MAX_SPEED,  
+        MIN_SPEED  
+    );  
+
+
+return clamp_int(  
+    speed,  
+    MIN_SPEED,  
+    MAX_SPEED  
+);
+}
+// ============================================================
+
+//                       LINE RECOVERY
+
+// ============================================================
+static void recoverLine(void)
+
+{
+
+/*
+
+* lastError < 0
+
+*     line was on LEFT
+
+*
+
+* lastError > 0
+
+*     line was on RIGHT
+
+*/
+if (lastError < 0)  
+{  
+    // Turn LEFT  
+
+    driveSmooth(  
+        -SHARP_TURN_SPEED,  
+         SHARP_TURN_SPEED  
+    );  
+}  
+
+else  
+{  
+    // Turn RIGHT
+
+Fouad Kh, [09/10/2026 23:58]
+driveSmooth(  
+         SHARP_TURN_SPEED,  
+        -SHARP_TURN_SPEED  
+    );  
+}
+}
+// ============================================================
+
+//                     INTERSECTION
+
+// ============================================================
+static bool detectIntersection(
+
+int activeCount
+
+)
+
+{
+
+return (
+
+activeCount >=
+
+INTERSECTION_COUNT
+
+);
+
+}
+// ============================================================
+
+//                          MAIN
+
+// ============================================================
+void app_main(void)
+
+{
+
+gpio_init_all();
+pwm_init();  
+
+adc_init();  
+
+
+calibrate();  
+
+
+printf(  
+    "\nFAST LINE FOLLOWER STARTED\n"  
+);  
+
+
+while (1)  
+{  
+    int position = 0;  
+
+    int activeCount = 0;  
+
+
+    bool lineVisible =  
+        getLinePosition(  
+            &position,  
+            &activeCount  
+        );  
+
+
+    // ====================================================  
+    //                  LINE LOST  
+    // ====================================================  
+
+    if (!lineVisible)  
+    {  
+        recoverLine();  
+
+        vTaskDelay(  
+            pdMS_TO_TICKS(1)  
+        );  
+
+        continue;  
+    }  
+
+
+    // ====================================================  
+    //                 INTERSECTION  
+    // ====================================================  
+
+    if (detectIntersection(activeCount))  
+    {  
+        /*  
+         * Don't make a huge correction.  
+         * Pass through at high speed.  
+         */  
+
+        driveSmooth(  
+            MAX_SPEED,  
+            MAX_SPEED  
+        );  
+
+
+        vTaskDelay(  
+            pdMS_TO_TICKS(1)  
+        );  
+
+        continue;  
+    }  
+
+
+    // ====================================================  
+    //                      ERROR  
+    // ====================================================  
+
+    float error =  
+        (float)  
+        (position - SET_POINT);  
+
+
+    // ====================================================  
+    //                  PROPORTIONAL  
+    // ====================================================  
+
+    float P =  
+        error;  
+
+
+    // ====================================================  
+    //                     DERIVATIVE  
+    // ====================================================  
+
+    float rawD =  
+        error - lastError;  
+
+
+    /*  
+     * Low-pass filter for D.  
+     *  
+     * This prevents sensor noise from  
+     * producing aggressive motor corrections.  
+     */  
+
+    filteredD =  
+        (0.65f * filteredD) +  
+        (0.35f * rawD);  
+
+
+    // ====================================================  
+    //                     INTEGRAL  
+    // ====================================================  
+
+    if (Ki != 0.0f)  
+    {  
+        integral += error;  
+
+        integral =  
+            clamp_float(  
+                integral,  
+                -3000.0f,  
+                 3000.0f  
+            );  
+    }  
+
+    else  
+    {  
+        integral = 0;  
+    }  
+
+
+    // ====================================================  
+    //                     PID  
+    // ====================================================  
+
+    float correction =  
+        (Kp * P) +  
+        (Ki * integral) +  
+        (Kd * filteredD);  
+
+
+    lastError =  
+        error;  
+
+
+    // ====================================================  
+    //                 DYNAMIC SPEED  
+    // ====================================================  
+
+    int baseSpeed =  
+        calculateBaseSpeed(  
+            fabsf(error)  
+        );  
+
+
+    // ====================================================  
+    //                 MOTOR MIXING  
+    // ====================================================  
+
+    int leftTarget =  
+        (int)  
+        (baseSpeed + correction);  
+
+
+    int rightTarget =  
+        (int)  
+        (baseSpeed - correction);  
+
+
+    // ====================================================  
+    //                  MOTOR LIMIT  
+    // ====================================================
+
+Fouad Kh, [09/10/2026 23:58]
+leftTarget =  
+        clamp_int(  
+            leftTarget,  
+            -255,  
+            255  
+        );  
+
+    rightTarget =  
+        clamp_int(  
+            rightTarget,  
+            -255,  
+            255  
+        );  
+
+
+    // ====================================================  
+    //                SMOOTH MOTOR OUTPUT  
+    // ====================================================  
+
+    driveSmooth(  
+        leftTarget,  
+        rightTarget  
+    );  
+
+
+    // ====================================================  
+    //                    LOOP  
+    // ====================================================  
+
+    vTaskDelay(  
+        pdMS_TO_TICKS(1)  
+    );  
+}
+}
