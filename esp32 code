@@ -1,4 +1,4 @@
-Fouad Kh, [09/10/2026 23:58]
+
 // ============================================================
 
 //      ESP32 38-PIN - FAST QTR-8A LINE FOLLOWER
@@ -184,7 +184,6 @@ static int clamp_int(int x, int min, int max)
 
 if (x < min)
 
-Fouad Kh, [09/10/2026 23:58]
 return min;
 if (x > max)  
     return max;  
@@ -482,7 +481,6 @@ ledc_channel_config(&channelB);
 
 //                           ADC INIT
 
-Fouad Kh, [09/10/2026 23:58]
 // ============================================================
 static void adc_init(void)
 
@@ -767,7 +765,6 @@ else
 {  
     // Turn RIGHT
 
-Fouad Kh, [09/10/2026 23:58]
 driveSmooth(  
          SHARP_TURN_SPEED,  
         -SHARP_TURN_SPEED  
@@ -975,7 +972,6 @@ while (1)
     //                  MOTOR LIMIT  
     // ====================================================
 
-Fouad Kh, [09/10/2026 23:58]
 leftTarget =  
         clamp_int(  
             leftTarget,  
